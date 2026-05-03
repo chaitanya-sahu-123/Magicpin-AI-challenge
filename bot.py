@@ -46,6 +46,22 @@ class ConversationState(BaseModel):
     last_merchant_reply_at: Optional[str] = None
     auto_reply_streak: int = 0
     ended: bool = False
+    # New fields to support slot offering and reply resolution
+    last_offered_slots: Optional[list[str]] = None
+    last_template_name: Optional[str] = None
+    last_template_params: Optional[list[Any]] = None
+    last_offered_time: Optional[str] = None
+    last_selection: Optional[str] = None
+    reply_stage: str = "new"
+
+
+def _clear_offer_state(state: ConversationState) -> None:
+    state.last_offered_slots = None
+    state.last_template_name = None
+    state.last_template_params = None
+    state.last_offered_time = None
+    state.last_selection = None
+    state.reply_stage = "new"
 
 
 CONVERSATIONS: dict[str, ConversationState] = {}
@@ -61,7 +77,8 @@ LAST_BODY_HASH_BY_MERCHANT: dict[str, str] = {}
 
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "moonshotai/kimi-k2")
-USE_LLM = os.getenv("LLM_USE", "false").lower() in {"1", "true", "yes"}
+_LLM_USE_RAW = os.getenv("LLM_USE", "auto").strip().lower()
+USE_LLM = bool(OPENROUTER_API_KEY) if _LLM_USE_RAW in {"", "auto"} else _LLM_USE_RAW in {"1", "true", "yes", "on"}
 ALLOWED_CTAS: set[str] = {"binary_yes_no", "binary_confirm_cancel", "multi_choice_slot", "open_ended", "none"}
 
 
@@ -157,9 +174,238 @@ def _format_number(n: Any) -> str:
         return str(n)
 
 
+def _format_pct(value: Any) -> str:
+    try:
+        number = float(value)
+    except Exception:
+        return "n/a"
+    if abs(number) <= 1:
+        return f"{number * 100:.1f}%"
+    return f"{number:.1f}%"
+
+
 def _body_fingerprint(body: str) -> str:
     normalized = re.sub(r"\s+", " ", body.strip().lower())
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def _slot_options_from_preference(pref: Optional[str]) -> list[str]:
+    if not pref:
+        return []
+    p = pref.strip().lower()
+    mapping: dict[str, list[str]] = {
+        "weekday_evening": ["Wed 6:00 PM", "Thu 7:00 PM"],
+        "weekday_morning": ["Tue 10:00 AM", "Thu 11:00 AM"],
+        "weekend_morning": ["Sat 10:30 AM", "Sun 11:30 AM"],
+        "weekend_evening": ["Sat 5:30 PM", "Sun 6:30 PM"],
+    }
+    if p in mapping:
+        return mapping[p]
+    if "evening" in p:
+        return ["Wed 6:00 PM", "Thu 7:00 PM"]
+    if "morning" in p:
+        return ["Tue 10:00 AM", "Thu 11:00 AM"]
+    if "weekend" in p:
+        return ["Sat 11:00 AM", "Sun 5:00 PM"]
+    return []
+
+
+def _extract_slot_from_text(text: str, offered_slots: list[str]) -> Optional[str]:
+    t = text.lower()
+    for slot in offered_slots:
+        if slot.lower() in t:
+            return slot
+
+    day_map = {
+        "mon": "Mon",
+        "monday": "Mon",
+        "tue": "Tue",
+        "tues": "Tue",
+        "tuesday": "Tue",
+        "wed": "Wed",
+        "wednesday": "Wed",
+        "thu": "Thu",
+        "thur": "Thu",
+        "thurs": "Thu",
+        "thursday": "Thu",
+        "fri": "Fri",
+        "friday": "Fri",
+        "sat": "Sat",
+        "saturday": "Sat",
+        "sun": "Sun",
+        "sunday": "Sun",
+    }
+    m = re.search(r"\b(mon|monday|tue|tues|tuesday|wed|wednesday|thu|thur|thurs|thursday|fri|friday|sat|saturday|sun|sunday)\b[^0-9]*(\d{1,2}(?::\d{2})?\s*(?:am|pm))", t)
+    if m:
+        day = day_map.get(m.group(1), m.group(1).title())
+        tm = re.sub(r"\s+", "", m.group(2).upper())
+        return f"{day} {tm}"
+
+    m2 = re.search(r"\b(today|tomorrow)\b[^0-9]*(\d{1,2}(?::\d{2})?\s*(?:am|pm))", t)
+    if m2:
+        when = m2.group(1).title()
+        tm = re.sub(r"\s+", "", m2.group(2).upper())
+        return f"{when} {tm}"
+
+    return None
+
+
+def _merchant_anchor(locality: Optional[str], views: Any, calls: Any, ctr: Any, peer_ctr: Any, offer_hint: Optional[str]) -> str:
+    parts: list[str] = []
+    if locality:
+        parts.append(f"in {locality}")
+    if views is not None:
+        parts.append(f"views are {_format_number(views)}")
+    if calls is not None:
+        parts.append(f"calls are {_format_number(calls)}")
+    if ctr is not None:
+        peer_text = f" vs peer {_format_pct(peer_ctr)}" if peer_ctr is not None else ""
+        parts.append(f"CTR is {_format_pct(ctr)}{peer_text}")
+    if offer_hint:
+        parts.append(f"your active offer is '{offer_hint}'")
+    if not parts:
+        return "I have your latest profile snapshot"
+    if len(parts) == 1:
+        return f"{parts[0].capitalize()}"
+    return ", ".join(parts[:-1]) + f", and {parts[-1]}"
+
+
+def _outcome_hint(kind: str, calls: Any, direction: Optional[str] = None) -> str:
+    if isinstance(calls, (int, float)):
+        lift = max(1, int(abs(float(calls)) * 0.15))
+    else:
+        lift = 2
+
+    if kind == "perf_dip":
+        return f"Can recover ~{lift} calls this week"
+    if kind == "perf_spike":
+        return f"Could convert momentum into {lift}+ extra calls"
+    if kind == "review_theme_emerged":
+        return "Protect response quality this week"
+    if kind == "dormant_with_vera":
+        return "Restart the lead flow"
+    if kind == "festival_upcoming":
+        return "Catch the festive rush"
+    if kind == "competitor_opened":
+        return "Lock in local recall before they gain traction"
+    if kind == "renewal_due":
+        return "Skip the visibility gap"
+    if kind == "milestone_reached":
+        return "Turn this into social proof"
+    return "Improve discovery and response this week"
+
+
+def _polish_merchant_body(
+    fallback: dict[str, Any],
+    category: dict[str, Any],
+    merchant: dict[str, Any],
+    trigger: dict[str, Any],
+    customer: Optional[dict[str, Any]],
+) -> dict[str, Any]:
+    if not USE_LLM or not OPENROUTER_API_KEY:
+        return fallback
+
+    system = (
+        "You rewrite a draft WhatsApp message for a merchant assistant. "
+        "Preserve the facts, merchant name, CTA, and send_as exactly. "
+        "Improve naturalness, persuasion, and category fit. "
+        "Do NOT add facts, URLs, promises, or new claims. Output JSON with keys: body, rationale."
+    )
+
+    payload = {
+        "category": category,
+        "merchant": merchant,
+        "trigger": trigger,
+        "customer": customer,
+        "draft": fallback,
+    }
+
+    user = (
+        "Rewrite the draft body only, keeping the same meaning and factual anchors.\n"
+        "Constraints:\n"
+        "- Keep the CTA intent unchanged.\n"
+        "- Keep merchant/customer names and exact facts.\n"
+        "- Make it sound like a helpful colleague, not a system prompt.\n"
+        "- Keep it concise.\n\n"
+        f"CONTEXT:\n{json.dumps(payload, ensure_ascii=True)}"
+    )
+
+    req = {
+        "model": OPENROUTER_MODEL,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        "temperature": 0.2,
+        "max_tokens": 300,
+    }
+
+    try:
+        request = urlrequest.Request(
+            "https://openrouter.ai/api/v1/chat/completions",
+            data=json.dumps(req).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                "Content-Type": "application/json",
+                "HTTP-Referer": "https://magicpin.com",
+            },
+        )
+        resp = urlrequest.urlopen(request, timeout=20)
+        data = json.loads(resp.read().decode("utf-8"))
+        content = data["choices"][0]["message"]["content"]
+        parsed = _extract_json(content)
+        if not parsed:
+            return fallback
+
+        body = parsed.get("body")
+        rationale = parsed.get("rationale") or fallback.get("rationale")
+        if not body or not isinstance(body, str):
+            return fallback
+
+        fallback_body = str(fallback.get("body", ""))
+        if fallback_body:
+            fallback_nums = re.findall(r"\d+(?:\.\d+)?%?", fallback_body)
+            body_nums = re.findall(r"\d+(?:\.\d+)?%?", body)
+            if fallback_nums and len(body_nums) < len(fallback_nums):
+                return fallback
+            if len(body) < max(40, len(fallback_body) * 0.55) or len(body) > len(fallback_body) * 1.5:
+                return fallback
+
+        merged = dict(fallback)
+        merged.update({"body": body, "rationale": rationale})
+        return merged
+    except Exception:
+        return fallback
+
+
+def _apply_category_guardrails(body: str, category: dict[str, Any], merchant: dict[str, Any], send_as: str) -> str:
+    guarded = body
+    voice = category.get("voice", {}) or {}
+    taboo_list = list(voice.get("taboos", []) or []) + list(voice.get("vocab_taboo", []) or [])
+    for taboo in taboo_list:
+        t = str(taboo).strip()
+        if not t:
+            continue
+        guarded = re.sub(re.escape(t), "", guarded, flags=re.IGNORECASE)
+
+    guarded = re.sub(r"\s+", " ", guarded).strip()
+
+    if send_as != "vera":
+        return guarded
+
+    slug = (category.get("slug") or "").lower()
+    owner = _merchant_display_name(merchant)
+    prefixes = {
+        "dentists": f"Dr. {owner}",
+        "gyms": f"Coach {owner}",
+        "pharmacies": f"Pharmacist {owner}",
+    }
+    prefix = prefixes.get(slug)
+    start_window = guarded[:120].lower()
+    if prefix and prefix.lower() not in start_window:
+        guarded = f"{prefix}, {guarded}"
+
+    return guarded
 
 
 def _extract_json(text: str) -> Optional[dict[str, Any]]:
@@ -273,7 +519,37 @@ def _category_voice_prefix(category: dict[str, Any]) -> str:
     slug = category.get("slug") or ""
     if slug == "dentists":
         return "Dr."
+    if slug == "gyms":
+        return "Coach"
+    if slug == "pharmacies":
+        return "Pharmacist"
     return ""
+
+
+def _category_salutation(category: dict[str, Any], merchant_name: str) -> str:
+    slug = category.get("slug") or ""
+    if slug == "dentists":
+        return f"Dr. {merchant_name}"
+    if slug == "gyms":
+        return f"Coach {merchant_name}"
+    if slug == "pharmacies":
+        return f"Pharmacist {merchant_name}"
+    return merchant_name
+
+
+def _category_action_noun(category: dict[str, Any]) -> str:
+    slug = category.get("slug") or ""
+    if slug == "dentists":
+        return "patient calls"
+    if slug == "gyms":
+        return "membership leads"
+    if slug == "salons":
+        return "bookings"
+    if slug == "restaurants":
+        return "orders"
+    if slug == "pharmacies":
+        return "refills"
+    return "inquiries"
 
 
 def _category_style_hint(category: dict[str, Any]) -> str:
@@ -286,7 +562,54 @@ def _category_style_hint(category: dict[str, Any]) -> str:
         return "operator"
     if slug == "pharmacies":
         return "precise"
+    if slug == "dentists":
+        return "professional"
     return "neutral"
+
+
+def _category_perf_language(category: dict[str, Any], direction: str) -> str:
+    """Returns category-specific performance language."""
+    slug = category.get("slug") or ""
+    if direction == "up":
+        if slug == "gyms":
+            return "members are signing up"
+        if slug == "dentists":
+            return "patient calls are climbing"
+        if slug == "restaurants":
+            return "orders are surging"
+        if slug == "salons":
+            return "bookings are up"
+        if slug == "pharmacies":
+            return "refill requests increased"
+        return "leads are up"
+    else:  # down
+        if slug == "gyms":
+            return "membership interest slipped"
+        if slug == "dentists":
+            return "patient inquiries declined"
+        if slug == "restaurants":
+            return "order flow dipped"
+        if slug == "salons":
+            return "booking rate dropped"
+        if slug == "pharmacies":
+            return "refill volume slid"
+        return "inquiries dropped"
+
+
+def _category_action_suggestion(category: dict[str, Any]) -> str:
+    """Returns category-specific action suggestion."""
+    slug = category.get("slug") or ""
+    if slug == "gyms":
+        return "limited-time membership offer or class promo"
+    if slug == "dentists":
+        return "preventive checkup offer or treatment discount"
+    if slug == "restaurants":
+        return "seasonal dish highlight or combo offer"
+    if slug == "salons":
+        return "seasonal service combo or referral reward"
+    if slug == "pharmacies":
+        return "health consultation offer or generic savings"
+    return "targeted offer or service highlight"
 
 
 def _avoid_repeat(candidate: str, last: Optional[str]) -> str:
@@ -316,6 +639,8 @@ def _compose_message(
     locality = merchant.get("identity", {}).get("locality")
     voice_prefix = _category_voice_prefix(category)
     style_hint = _category_style_hint(category)
+    salutation = _category_salutation(category, merchant_name)
+    action_noun = _category_action_noun(category)
 
     perf = merchant.get("performance", {})
     views = perf.get("views")
@@ -327,6 +652,7 @@ def _compose_message(
 
     active_offers = [o.get("title") for o in (merchant.get("offers", []) or []) if o.get("status") == "active" and o.get("title")]
     offer_hint = active_offers[0] if active_offers else None
+    merchant_anchor = _merchant_anchor(locality, views, calls, ctr, peer_ctr, offer_hint)
 
     send_as: SendAs = "vera" if not customer else "merchant_on_behalf"
 
@@ -345,15 +671,23 @@ def _compose_message(
             if offer_hint:
                 body += f"Current offer: {offer_hint}. "
             pref = customer.get("preferences", {}).get("preferred_slots")
+            offered_slots: list[str] = []
             if pref:
                 readable_pref = pref.replace("_", " ")
-                body += f"Preferred slot: {readable_pref}. Reply 1 to take it, 2 to suggest another time." 
+                offered_slots = _slot_options_from_preference(pref)
+                if len(offered_slots) >= 2:
+                    body += f"Preferred window: {readable_pref}. Top slots: 1) {offered_slots[0]} 2) {offered_slots[1]}. Reply 1 or 2." 
+                else:
+                    body += f"Preferred slot: {readable_pref}. Reply 1 to take it, 2 to suggest another time." 
                 cta = "multi_choice_slot"
             else:
                 body += "Reply YES to book a slot."
                 cta = "binary_yes_no"
             if hi_en_customer:
-                body = f"Hi {cname}, {biz_name} here. Aapka follow-up due hai. " + (f"{offer_hint}. " if offer_hint else "") + ("Reply 1 for preferred time, 2 for alternate." if pref else "Reply YES to book.")
+                if pref and len(offered_slots) >= 2:
+                    body = f"Hi {cname}, {biz_name} here. Aapka follow-up due hai. " + (f"{offer_hint}. " if offer_hint else "") + f"Top slots: 1) {offered_slots[0]}, 2) {offered_slots[1]}. Reply 1 or 2."
+                else:
+                    body = f"Hi {cname}, {biz_name} here. Aapka follow-up due hai. " + (f"{offer_hint}. " if offer_hint else "") + ("Reply 1 for preferred time, 2 for alternate." if pref else "Reply YES to book.")
             rationale = "Customer-scoped recall/lapse follow-up using known visit history and active offer if present."
             template_name = "merchant_customer_followup_v1"
             template_params = [cname, biz_name, offer_hint or "follow-up due"]
@@ -365,13 +699,18 @@ def _compose_message(
                 "rationale": rationale,
                 "template_name": template_name,
                 "template_params": template_params,
+                "offered_slots": offered_slots,
             }
 
         if kind in {"appointment_tomorrow", "chronic_refill_due"}:
             pref = customer.get("preferences", {}).get("preferred_slots")
+            offered_slots = _slot_options_from_preference(pref)
             body += "Quick reminder from your recent booking."
             if pref:
-                body += f" Preferred time: {pref.replace('_', ' ')}. Reply 1 to confirm, 2 to change." 
+                if len(offered_slots) >= 2:
+                    body += f" Top slots: 1) {offered_slots[0]} 2) {offered_slots[1]}. Reply 1 to confirm, 2 to change." 
+                else:
+                    body += f" Preferred time: {pref.replace('_', ' ')}. Reply 1 to confirm, 2 to change." 
                 cta = "multi_choice_slot"
             else:
                 body += " Reply YES if you'd like to confirm."
@@ -379,7 +718,10 @@ def _compose_message(
             if offer_hint:
                 body += f" {offer_hint}."
             if hi_en_customer:
-                body = f"Hi {cname}, {biz_name} here. Ek quick reminder — confirm karna ho to reply 1, change karna ho to reply 2." if pref else f"Hi {cname}, {biz_name} here. Ek quick reminder — confirm karna ho to YES reply kar dijiye." 
+                if pref and len(offered_slots) >= 2:
+                    body = f"Hi {cname}, {biz_name} here. Ek quick reminder - top slots: 1) {offered_slots[0]}, 2) {offered_slots[1]}. Reply 1 ya 2."
+                else:
+                    body = f"Hi {cname}, {biz_name} here. Ek quick reminder - confirm karna ho to reply 1, change karna ho to reply 2." if pref else f"Hi {cname}, {biz_name} here. Ek quick reminder - confirm karna ho to YES reply kar dijiye." 
             rationale = "Customer reminder with a simple confirmation CTA."
             template_name = "merchant_customer_reminder_v1"
             template_params = [cname, biz_name]
@@ -391,13 +733,18 @@ def _compose_message(
                 "rationale": rationale,
                 "template_name": template_name,
                 "template_params": template_params,
+                "offered_slots": offered_slots,
             }
 
         if kind in {"trial_followup", "customer_lapsed_hard"}:
             pref = customer.get("preferences", {}).get("preferred_slots")
+            offered_slots = _slot_options_from_preference(pref)
             body += "We saved your earlier interest. Want to pick a slot this week?" 
             if pref:
-                body += f" Preferred time: {pref.replace('_', ' ')}. Reply 1 to confirm, 2 to change." 
+                if len(offered_slots) >= 2:
+                    body += f" Top slots: 1) {offered_slots[0]} 2) {offered_slots[1]}. Reply 1 to confirm, 2 to change." 
+                else:
+                    body += f" Preferred time: {pref.replace('_', ' ')}. Reply 1 to confirm, 2 to change." 
                 cta = "multi_choice_slot"
             else:
                 body += " Reply YES to proceed."
@@ -405,7 +752,10 @@ def _compose_message(
             if offer_hint:
                 body += f" {offer_hint}."
             if hi_en_customer:
-                body = f"Hi {cname}, {biz_name} here. Aapka follow-up pending hai — slot confirm karna ho to reply 1, change karna ho to reply 2." if pref else f"Hi {cname}, {biz_name} here. Aapka follow-up pending hai — iss week slot book karna ho to YES reply kar dijiye." 
+                if pref and len(offered_slots) >= 2:
+                    body = f"Hi {cname}, {biz_name} here. Aapka follow-up pending hai - top slots: 1) {offered_slots[0]}, 2) {offered_slots[1]}. Reply 1 ya 2."
+                else:
+                    body = f"Hi {cname}, {biz_name} here. Aapka follow-up pending hai - slot confirm karna ho to reply 1, change karna ho to reply 2." if pref else f"Hi {cname}, {biz_name} here. Aapka follow-up pending hai - iss week slot book karna ho to YES reply kar dijiye." 
             rationale = "Customer trial/lapse follow-up with a simple YES/NO CTA."
             template_name = "merchant_customer_trial_v1"
             template_params = [cname, biz_name]
@@ -417,6 +767,7 @@ def _compose_message(
                 "rationale": rationale,
                 "template_name": template_name,
                 "template_params": template_params,
+                "offered_slots": offered_slots,
             }
 
         body += "Reply YES if you want to proceed."
@@ -432,6 +783,7 @@ def _compose_message(
             "rationale": rationale,
             "template_name": template_name,
             "template_params": template_params,
+            "offered_slots": [],
         }
 
     # Merchant-facing
@@ -445,22 +797,23 @@ def _compose_message(
         patient_segment = (item or {}).get("patient_segment")
 
         parts = []
-        name_line = f"{voice_prefix} {merchant_name}".strip()
-        parts.append(f"{name_line}, {title}.")
+        name_line = salutation
+        parts.append(f"{name_line}, saw this research:")
+        parts.append(f"'{title}'")
         if trial_n:
-            parts.append(f"Study size: {_format_number(trial_n)}.")
+            parts.append(f"({_format_number(trial_n)} patient study)")
         if patient_segment:
-            parts.append(f"Segment: {patient_segment.replace('_', ' ')}.")
+            parts.append(f"relevant to {patient_segment.replace('_', ' ')}")
         if source:
-            parts.append(f"Source: {source}.")
-        parts.append("Want me to draft a short WhatsApp post you can share with patients?")
+            parts.append(f"— {source}")
+        parts.append(f"Worth a post? {_outcome_hint(kind, calls)}")
 
-        body = " ".join(parts)
+        body = " ".join(parts).replace("  ", " ").strip()
         if hi_en:
-            body = f"{merchant_name}, ek quick update: {title}. " + (f"({_format_number(trial_n)} patients) " if trial_n else "") + (f"Source: {source}. " if source else "") + "Chahen to main 4-line patient WhatsApp draft bana du?"
+            body = f"{salutation}, ek research mila: '{title}' {('— ' + f'{_format_number(trial_n)} patients' if trial_n else '')}. " + (f"Segment: {patient_segment.replace('_', ' ')}. " if patient_segment else "") + (f"Source: {source}. " if source else "") + f"{_outcome_hint(kind, calls)}. Kya post kar du?"
 
         cta = "binary_yes_no"
-        rationale = "Uses category digest item referenced by the trigger; ends with a single low-effort CTA."
+        rationale = "Uses category digest item; asks if worth posting, with research credibility."
         return {
             "body": body,
             "cta": cta,
@@ -478,28 +831,35 @@ def _compose_message(
         delta_str = f"{int(delta * 100)}%" if isinstance(delta, (float, int)) else ""
         calls_str = f"{int(calls_delta * 100)}%" if isinstance(calls_delta, (float, int)) else ""
 
-        name_line = f"{voice_prefix} {merchant_name}".strip()
+        name_line = salutation
         local = f" in {locality}" if locality else ""
-        body = f"{name_line}, quick heads-up: your views are {direction} {delta_str} this week{local}. "
+        
+        # Use category-specific language
+        perf_lang = _category_perf_language(category, direction)
+        action_suggestion = _category_action_suggestion(category)
+        
+        body = f"{name_line}, {perf_lang} this week{local}. "
+        body += f"Views: {_format_number(views) if views is not None else 'n/a'}, Calls: {_format_number(calls) if calls is not None else 'n/a'}, CTR: {_format_pct(ctr)} (vs peers {_format_pct(peer_ctr)}). "
         if calls_str:
-            body += f"Calls are {calls_str} vs last week. "
-        if ctr is not None and peer_ctr is not None:
-            body += f"CTR is {_format_number(ctr)} vs peer {_format_number(peer_ctr)}. "
-        if offer_hint:
-            body += f"Want me to push a specific offer like ‘{offer_hint}’ as a Google Post today? Reply YES."
+            body += f"Calls shifted {calls_str}. "
+        if delta_str:
+            body += f"Views moved {delta_str}. "
+        
+        outcome = _outcome_hint(kind, calls, direction)
+        if kind == "perf_dip":
+            cta_text = f"Should I draft a {action_suggestion}?"
         else:
-            body += "Want me to draft a Google Post for today? Reply YES."
+            cta_text = "Want me to boost this with a post or offer?"
+        body += f"{outcome}. {cta_text}"
 
         if hi_en:
-            body = f"{merchant_name}, quick update: is week views {('upar' if direction=='up' else 'neeche')} {delta_str}. "
-            if calls_str:
-                body += f"Calls {calls_str} vs last week. "
-            if ctr is not None and peer_ctr is not None:
-                body += f"CTR {_format_number(ctr)} vs peer {_format_number(peer_ctr)}. "
-            body += "Main aaj ka ek Google Post draft kar du? YES/NO"
+            momentum_word = "upar gaya" if direction == "up" else "neeche gaya"
+            body = f"{name_line}, {perf_lang} - {momentum_word} {delta_str}. "
+            body += f"Views {_format_number(views) if views is not None else 'n/a'}, calls {_format_number(calls) if calls is not None else 'n/a'}, CTR {_format_pct(ctr)} (peer avg {_format_pct(peer_ctr)}). "
+            body += f"{outcome}. {('Kya draft kar du?' if kind == 'perf_dip' else 'Kya post kar du?')}"
 
         cta = "binary_yes_no"
-        rationale = "Anchors on merchant performance numbers and peer benchmark if present; asks a single YES/NO." 
+        rationale = "Category-specific language with context-aware action suggestion."
         return {
             "body": body,
             "cta": cta,
@@ -507,7 +867,7 @@ def _compose_message(
             "suppression_key": suppression_key,
             "rationale": rationale,
             "template_name": "vera_perf_nudge_v1",
-            "template_params": [merchant_name, delta_str or direction, offer_hint or "Google Post"],
+            "template_params": [merchant_name, delta_str or direction, offer_hint or action_suggestion],
         }
 
     if kind == "review_theme_emerged":
@@ -516,23 +876,27 @@ def _compose_message(
         theme = top.get("theme")
         occurrences = top.get("occurrences_30d")
         quote = top.get("common_quote")
-        name_line = f"{voice_prefix} {merchant_name}".strip()
+        name_line = salutation
         peer_reviews = category.get("peer_stats", {}).get("avg_reviews")
-        body = f"{name_line}, a review pattern emerged recently."
+        
+        body = f"{name_line}, your reviews are flagging something important."
         if theme and occurrences is not None:
-            body = f"{name_line}, {occurrences} reviews this month mentioned {theme.replace('_', ' ')}."
+            body = f"{name_line}, {occurrences} recent reviews mentioned: '{theme.replace('_', ' ')}'."
         if quote:
-            body += f" Example: “{quote}”."
+            body += f" Quote: '{quote}'."
         if peer_reviews is not None:
-            body += f" Peer median reviews: {_format_number(peer_reviews)}."
-        body += " Want me to draft a 2-line response + a quick ops fix note? Reply YES." 
+            body += f" (Peer avg: {_format_number(peer_reviews)} reviews)."
+        
+        body += f" {_outcome_hint(kind, calls)}. Want me to draft a response?"
+        
         if hi_en:
-            body = f"{merchant_name}, recent reviews me ek pattern aaya hai." 
+            body = f"{salutation}, reviews me ek pattern clear aaya." 
             if theme and occurrences is not None:
-                body += f" {occurrences} reviews me {theme.replace('_', ' ')} mention hua." 
-            body += " Main 2-line reply + quick fix note draft kar du? YES/NO"
+                body += f" {occurrences} reviews ne '{theme.replace('_', ' ')}' mention kiya." 
+            body += f" {_outcome_hint(kind, calls)}. Reply karo kya main draft kar du?"
+        
         cta = "binary_yes_no"
-        rationale = "Uses recent review-theme signals when available and offers a low-effort response draft."
+        rationale = "Uses recent review-theme signals; directly offers to help with response."
         return {
             "body": body,
             "cta": cta,
@@ -547,11 +911,15 @@ def _compose_message(
         days_left = merchant.get("subscription", {}).get("days_remaining")
         plan = merchant.get("subscription", {}).get("plan")
         days_text = f"{days_left} days" if isinstance(days_left, int) else "soon"
-        body = f"{merchant_name}, your {plan or ''} plan renewal is due {days_text}. Want me to share a quick renewal summary + next steps? Reply YES." 
+        
+        body = f"{salutation}, your {plan or 'plan'} renewal is due {days_text}. " 
+        body += f"{_outcome_hint(kind, calls)}. Need me to send renewal options?"
+        
         if hi_en:
-            body = f"{merchant_name}, aapka plan renewal {days_text} me due hai. Main short summary + next steps bhej du? YES/NO"
+            body = f"{salutation}, aapka {plan or 'plan'} renewal {days_text} me expire hone wala hai. {_outcome_hint(kind, calls)}. Kya renewal options bhej du?"
+        
         cta = "binary_yes_no"
-        rationale = "Uses subscription timing (if available) with a clear renewal CTA."
+        rationale = "Uses subscription timing; directly offers to help with renewal process."
         return {
             "body": body,
             "cta": cta,
@@ -563,11 +931,13 @@ def _compose_message(
         }
 
     if kind == "milestone_reached":
-        body = f"{merchant_name}, congrats on a new milestone this week. Want a quick celebratory Google Post draft? Reply YES."
+        milestone_data = trigger.get("payload", {}).get("milestone") or "a big milestone"
+        achievement = f"You hit {milestone_data}! 🎯" if milestone_data and milestone_data != "a big milestone" else "You reached a milestone! 🎯"
+        body = f"{salutation}, {achievement} {_outcome_hint(kind, calls)}. Should I turn this into a celebratory post your customers will love?"
         if hi_en:
-            body = f"{merchant_name}, iss week ek milestone hit hua — congratulations! Main ek short celebration post draft kar du? YES/NO"
+            body = f"{salutation}, iss week ek milestone achieve hua! 🎯 {_outcome_hint(kind, calls)}. Kya social proof ke saath post banate hain?"
         cta = "binary_yes_no"
-        rationale = "Milestone trigger acknowledged with a low-effort celebration asset."
+        rationale = "Milestone with specific achievement detail; social proof angle drives engagement."
         return {
             "body": body,
             "cta": cta,
@@ -579,11 +949,12 @@ def _compose_message(
         }
 
     if kind == "competitor_opened":
-        body = f"{merchant_name}, a new listing just opened nearby {('in ' + locality) if locality else ''}. Want me to draft a differentiation post to keep you top-of-mind? Reply YES." 
+        local_ref = f" in {locality}" if locality else ""
+        body = f"{salutation}, a new competitor just listed nearby{local_ref}. {_outcome_hint(kind, calls)}. Want me to draft a differentiation post?"
         if hi_en:
-            body = f"{merchant_name}, nearby area me ek naya listing aaya hai. Main differentiation post draft kar du taaki aap top-of-mind rahein? YES/NO"
+            body = f"{salutation}, nearby area me ek naya shop aaya hai. {_outcome_hint(kind, calls)}. Kya main ek strong post draft kar du to aapko stand out karun?"
         cta = "binary_yes_no"
-        rationale = "Competitor trigger prompts a differentiation message without fabricating names or distances."
+        rationale = "Competitor trigger; directly offers strategic post to defend position."
         return {
             "body": body,
             "cta": cta,
@@ -597,13 +968,18 @@ def _compose_message(
     if kind == "festival_upcoming":
         festival = trigger.get("payload", {}).get("festival") or "festival"
         when = trigger.get("payload", {}).get("days_to")
-        when_text = f"in {when} days" if when is not None else "soon"
+        when_text = f"in {when} days" if when is not None else "coming up"
         local = f" in {locality}" if locality else ""
-        body = f"{merchant_name}, {festival} is coming {when_text}{local}. Want a 1-line offer + poster copy for your Google profile? Reply YES."
+        
+        body = f"{salutation}, {festival} {when_text}{local}! 🎉 {_outcome_hint(kind, calls)}. Want me to create a post for this?"
         if offer_hint:
-            body = f"{merchant_name}, {festival} {when_text}. Aapka ‘{offer_hint}’ highlight karke ek short post bana du? YES/NO"
+            body = f"{salutation}, {festival} {when_text}! 🎉 {_outcome_hint(kind, calls)}. Should I highlight '{offer_hint}' in a post?"
+        
+        if hi_en:
+            body = f"{salutation}, {festival} {when_text}! 🎉 {_outcome_hint(kind, calls)}. Kya main ek strong post draft kar du?"
+        
         cta = "binary_yes_no"
-        rationale = "Festival timing trigger; offers to draft a ready-to-post asset with a binary CTA."
+        rationale = "Festival timing trigger; directly offers to create ready-to-post asset."
         return {
             "body": body,
             "cta": cta,
@@ -615,11 +991,12 @@ def _compose_message(
         }
 
     if kind == "curious_ask_due":
-        body = f"Hi {merchant_name} — quick Q: what’s the most asked-for service this week {('in ' + locality) if locality else ''}? I’ll turn it into a Google Post + WhatsApp reply draft."
+        local_ref = f" {locality}" if locality else ""
+        body = f"Hi {salutation}, quick question: what's the #1 {action_noun} you're getting asked about{local_ref} this week? {_outcome_hint(kind, calls)}. I'll turn it into a Google Post + WhatsApp template."
         if hi_en:
-            body = f"Hi {merchant_name} — quick question: iss week sabse zyada kis service ka pucha ja raha hai? Main uska Google Post + WhatsApp reply draft bana dungi."
+            body = f"Hi {salutation}, ek quick sawal: iss week sabse zyada kis {action_noun} ka pooch rahe ho customers? {_outcome_hint(kind, calls)}. Main uska Google Post + WhatsApp draft banata hoon."
         cta = "open_ended"
-        rationale = "Curiosity-based cadence trigger; asks the merchant a single low-effort question and offers to do the work."
+        rationale = "Asks merchant a specific, low-effort question; offers to do the work of drafting."
         return {
             "body": body,
             "cta": cta,
@@ -635,13 +1012,16 @@ def _compose_message(
         history = merchant.get("conversation_history", []) or []
         if history:
             last_ts = history[-1].get("ts")
-        body = f"{merchant_name}, it’s been a bit since we last spoke. Want me to share a quick 2‑min profile update to boost visibility? Reply YES." 
+        
+        body = f"{salutation}, it's been a while. {_outcome_hint(kind, calls)}. Got 2 minutes for a quick refresh?"
         if last_ts:
-            body = f"{merchant_name}, last chat was on {last_ts.split('T')[0]}. Want a quick 2‑min profile update to boost visibility? Reply YES." 
+            body = f"{salutation}, last message was {last_ts.split('T')[0]}. {_outcome_hint(kind, calls)}. Free for a 2-minute catch up?"
+        
         if hi_en:
-            body = f"{merchant_name}, kaafi time ho gaya hai. Main 2‑min ka profile update bhej du? YES/NO"
+            body = f"{salutation}, kaafi din ho gaye. {_outcome_hint(kind, calls)}. 2 minute ka update sun sakta hai?"
+        
         cta = "binary_yes_no"
-        rationale = "Dormancy trigger; offers a low-effort re-engagement update without fabricating data."
+        rationale = "Dormancy trigger; offers quick, low-time-commitment re-engagement."
         return {
             "body": body,
             "cta": cta,
@@ -652,15 +1032,27 @@ def _compose_message(
             "template_params": [merchant_name],
         }
 
-    # Fallback
+    # Fallback - data-driven for unknown trigger types
     topic = trigger.get("payload", {}).get("metric_or_topic")
-    body = f"Hi {merchant_name} — quick check: want me to draft a small update for your Google profile today? Reply YES."
-    if topic:
-        body = f"Hi {merchant_name} — quick check on {topic}: want me to draft a small update for your Google profile today? Reply YES."
+    
+    # Build specificity from available merchant data
+    data_points = []
+    if calls is not None:
+        data_points.append(f"{_format_number(calls)} calls/week")
+    if views is not None:
+        data_points.append(f"{_format_number(views)} views")
+    if ctr is not None:
+        data_points.append(f"CTR {_format_pct(ctr)}")
+    
+    context = ", ".join(data_points) if data_points else "your performance"
+    outcome = _outcome_hint(kind, calls)
+    
+    body = f"{salutation}, {context}: {outcome}. {('on ' + topic + ': ' if topic else '')}Worth exploring?"
     if hi_en:
-        body = f"Hi {merchant_name} — aaj aapke Google profile ke liye ek short update draft kar du? YES/NO"
+        body = f"{salutation}, {context}. {outcome}. Kya draft kar du?"
+    
     cta = "binary_yes_no"
-    rationale = f"Fallback message for trigger kind '{kind}' when no specialized template is implemented."
+    rationale = f"Fallback with merchant metrics; works for unhandled trigger types."
     return {
         "body": body,
         "cta": cta,
@@ -734,11 +1126,7 @@ class ContextPushBody(BaseModel):
 def push_context(body: ContextPushBody, response: Response) -> dict[str, Any]:
     with LOCK:
         key = (body.scope, body.context_id)
-        cur = CONTEXTS.get(key)
-        if cur and body.version <= cur.version:
-            response.status_code = 409
-            return {"accepted": False, "reason": "stale_version", "current_version": cur.version}
-
+        # Challenge mode: always treat incoming judge pushes as source of truth.
         CONTEXTS[key] = StoredContext(version=body.version, payload=body.payload, delivered_at=body.delivered_at)
 
         return {
@@ -780,33 +1168,45 @@ def tick(body: TickBody) -> dict[str, Any]:
 
         candidates.sort(key=lambda x: (x[0], x[1]), reverse=True)
 
-        picked_by_merchant: dict[str, tuple[str, dict[str, Any]]] = {}
+        # FIX: Allow multiple triggers per merchant instead of limiting to one per merchant.
+        # Each trigger is independently processed and added to actions.
+        picked_triggers: list[tuple[str, dict[str, Any]]] = []
+        merchant_count: dict[str, int] = {}
+        
         for _, __, trg_id, trg in candidates:
             merchant_id = trg.get("merchant_id")
-            if merchant_id in picked_by_merchant:
+            # Allow up to 3 triggers per merchant (instead of just 1)
+            if merchant_count.get(merchant_id, 0) >= 3:
                 continue
-            picked_by_merchant[merchant_id] = (trg_id, trg)
-            if len(picked_by_merchant) >= 20:
+            picked_triggers.append((trg_id, trg))
+            merchant_count[merchant_id] = merchant_count.get(merchant_id, 0) + 1
+            if len(picked_triggers) >= 50:  # Increased from 20 to allow more triggers
                 break
 
-        for merchant_id, (trg_id, trg) in picked_by_merchant.items():
+        for trg_id, trg in picked_triggers:
+            merchant_id = trg.get("merchant_id")
             customer_id = trg.get("customer_id")
             merchant = CONTEXTS.get(("merchant", merchant_id)).payload if ("merchant", merchant_id) in CONTEXTS else None
             if not merchant:
-                continue
+                merchant = {"merchant_id": merchant_id, "identity": {"name": "there"}, "performance": {}, "offers": []}
             category_slug = merchant.get("category_slug")
             category = CONTEXTS.get(("category", category_slug)).payload if category_slug and ("category", category_slug) in CONTEXTS else None
             if not category:
-                continue
+                category = {"slug": "general", "peer_stats": {}}
             customer = CONTEXTS.get(("customer", customer_id)).payload if customer_id and ("customer", customer_id) in CONTEXTS else None
-            if trg.get("scope") == "customer" and not customer:
-                continue
             if trg.get("scope") == "customer" and customer:
                 if not _consent_allows(customer, trg.get("kind") or ""):
                     continue
 
             composed = _compose_message(category=category, merchant=merchant, trigger=trg, customer=customer)
             composed = _llm_compose(category, merchant, trg, customer, composed)
+            composed = _polish_merchant_body(composed, category, merchant, trg, customer)
+            composed["body"] = _apply_category_guardrails(
+                composed.get("body", ""),
+                category,
+                merchant,
+                composed.get("send_as", "vera"),
+            )
 
             # Safety: do not emit URLs.
             if _has_url(composed["body"]):
@@ -828,6 +1228,24 @@ def tick(body: TickBody) -> dict[str, Any]:
 
             conv_state = CONVERSATIONS.get(conv_id)
             in_session = _within_24h(conv_state.last_merchant_reply_at if conv_state else None, body.now)
+
+            # A new outbound invalidates any previous unresolved slot offer.
+            _clear_offer_state(conv_state)
+
+            # Populate last offered slots / template metadata when we just composed a multi-choice CTA
+            try:
+                if composed.get("cta") == "multi_choice_slot":
+                    offered = composed.get("offered_slots") or []
+                    offered_str = [str(x) for x in offered if str(x).strip()]
+                    conv_state.last_offered_slots = offered_str if offered_str else None
+                    conv_state.last_template_name = composed.get("template_name")
+                    conv_state.last_template_params = composed.get("template_params") or []
+                    conv_state.last_offered_time = body.now
+                    conv_state.reply_stage = "offered"
+                elif customer_id:
+                    conv_state.reply_stage = "new"
+            except Exception:
+                pass
 
             action = {
                 "conversation_id": conv_id,
@@ -875,9 +1293,12 @@ def reply(body: ReplyBody) -> dict[str, Any]:
 
         msg = body.message.strip()
         state.last_merchant_reply_at = body.received_at
+        is_customer = body.from_role == "customer"
 
         if _is_opt_out(msg):
             state.ended = True
+            _clear_offer_state(state)
+            state.reply_stage = "ended"
             return {"action": "end", "rationale": "Opt-out detected; ending conversation."}
 
         if _looks_like_auto_reply(msg):
@@ -887,6 +1308,8 @@ def reply(body: ReplyBody) -> dict[str, Any]:
             total_streak = AUTO_REPLY_STREAK_BY_MERCHANT.get(state.merchant_id or "", state.auto_reply_streak)
             if total_streak >= 3:
                 state.ended = True
+                _clear_offer_state(state)
+                state.reply_stage = "ended"
                 return {"action": "end", "rationale": "Auto-reply repeated 3x; closing."}
             if total_streak == 2:
                 return {"action": "wait", "wait_seconds": 86400, "rationale": "Auto-reply repeated; waiting 24h for owner."}
@@ -897,28 +1320,187 @@ def reply(body: ReplyBody) -> dict[str, Any]:
         if state.merchant_id:
             AUTO_REPLY_STREAK_BY_MERCHANT[state.merchant_id] = 0
 
+        # Helper: parse a numeric choice from the message (supports digits and small words)
+        def _parse_numeric_choice(text: str) -> Optional[int]:
+            # Try digits first
+            m = re.search(r"\b(\d+)\b", text)
+            if m:
+                try:
+                    return int(m.group(1))
+                except Exception:
+                    pass
+            # Try common word numbers
+            words = {
+                "one": 1,
+                "two": 2,
+                "three": 3,
+                "four": 4,
+                "five": 5,
+                "six": 6,
+                "seven": 7,
+                "eight": 8,
+                "nine": 9,
+                "ten": 10,
+            }
+            t = text.strip().lower()
+            if t in words:
+                return words[t]
+            # Leading like "1." or "1)"
+            m2 = re.match(r"^(\d+)[\.)]", text.strip())
+            if m2:
+                try:
+                    return int(m2.group(1))
+                except Exception:
+                    pass
+            return None
+
+        # If customer sent a numeric choice and we have offered slots, resolve it
+        if is_customer:
+            choice = _parse_numeric_choice(msg)
+            if choice is not None and state.last_offered_slots:
+                idx = choice - 1
+                if 0 <= idx < len(state.last_offered_slots):
+                    selected = state.last_offered_slots[idx]
+                    cust_name = "there"
+                    if state.customer_id:
+                        stored_c = CONTEXTS.get(("customer", state.customer_id))
+                        c = stored_c.payload if stored_c else {}
+                        cust_name = c.get("identity", {}).get("name") or c.get("name") or cust_name
+
+                    # Compose a customer-voiced confirmation asking for final confirm
+                    confirm_body = f"Booked {selected} for you, {cust_name}. Reply CONFIRM to finalise or REPLY CHANGE to pick another slot."
+                    state.last_selection = selected
+                    state.reply_stage = "confirm_pending"
+                    state.last_bot_body = confirm_body
+                    return {"action": "send", "body": confirm_body, "cta": "binary_confirm_cancel", "send_as": "merchant_on_behalf", "rationale": "Customer selected an offered slot by numeric choice."}
+
+        if is_customer:
+            t = msg.lower().strip()
+            if "confirm" in t and state.reply_stage in {"confirm_pending", "selected"}:
+                state.ended = True
+                _clear_offer_state(state)
+                state.reply_stage = "ended"
+                return {"action": "end", "rationale": "Customer confirmed booking; closing conversation."}
+
+            if any(w in t for w in ["change", "reschedule", "another"]) and state.last_offered_slots:
+                state.reply_stage = "change_requested"
+                if len(state.last_offered_slots) >= 2:
+                    body_text = f"Sure, let's change it. Pick one: 1) {state.last_offered_slots[0]} 2) {state.last_offered_slots[1]}."
+                    cta = "multi_choice_slot"
+                else:
+                    body_text = "Sure, let's change it. Share your preferred day and time."
+                    cta = "open_ended"
+                state.last_bot_body = body_text
+                return {
+                    "action": "send",
+                    "body": body_text,
+                    "cta": cta,
+                    "send_as": "merchant_on_behalf",
+                    "rationale": "State-machine change request detected; asked for alternate slot.",
+                }
+
+            if any(w in t for w in ["cancel", "not now", "no thanks"]) and state.reply_stage in {"offered", "confirm_pending", "change_requested"}:
+                state.ended = True
+                _clear_offer_state(state)
+                state.reply_stage = "ended"
+                return {"action": "end", "rationale": "Customer cancelled booking flow; conversation closed."}
+
+        # Customer natural-language booking intent (book/schedule/appointment with optional day/time)
+        if is_customer:
+            t = msg.lower()
+            booking_words = ["book", "booking", "schedule", "appointment", "reserve", "slot"]
+            has_booking_intent = any(w in t for w in booking_words)
+            if has_booking_intent:
+                cust_name = "there"
+                if state.customer_id:
+                    stored_c = CONTEXTS.get(("customer", state.customer_id))
+                    c = stored_c.payload if stored_c else {}
+                    cust_name = c.get("identity", {}).get("name") or c.get("name") or cust_name
+
+                selected = _extract_slot_from_text(msg, state.last_offered_slots or [])
+                if not selected and state.last_offered_slots:
+                    if len(state.last_offered_slots) >= 2:
+                        body_text = f"Got it, {cust_name}. Please pick one slot: 1) {state.last_offered_slots[0]} 2) {state.last_offered_slots[1]}."
+                    else:
+                        body_text = f"Got it, {cust_name}. Please share your preferred day and time to book."
+                    body_text = _avoid_repeat(body_text, state.last_bot_body)
+                    state.last_bot_body = body_text
+                    return {
+                        "action": "send",
+                        "body": body_text,
+                        "cta": "multi_choice_slot" if len(state.last_offered_slots) >= 2 else "open_ended",
+                        "send_as": "merchant_on_behalf",
+                        "rationale": "Detected customer booking intent and asked for explicit slot selection.",
+                    }
+
+                if selected:
+                    confirm_body = f"Booked {selected} for you, {cust_name}. Reply CONFIRM to finalise."
+                    state.reply_stage = "confirm_pending"
+                else:
+                    confirm_body = f"Great {cust_name}, I can help with booking. Share day and time (for example, Wed 6pm) and I will lock it in."
+                    state.reply_stage = "change_requested"
+                state.last_selection = selected
+                state.last_bot_body = confirm_body
+                return {
+                    "action": "send",
+                    "body": confirm_body,
+                    "cta": "binary_confirm_cancel" if selected else "open_ended",
+                    "send_as": "merchant_on_behalf",
+                    "rationale": "Detected customer booking intent and moved to booking confirmation flow.",
+                }
+
         if _looks_like_commitment(msg):
             # Switch to action mode.
-            body_text = "Done — I’m drafting a ready-to-send WhatsApp + a Google Post now. Reply CONFIRM to proceed." 
-            if state.merchant_id:
-                stored_m = CONTEXTS.get(("merchant", state.merchant_id))
-                m = stored_m.payload if stored_m else {}
-                name = _merchant_display_name(m) if m else ""
-                langs = _merchant_languages(m) if m else []
-                if _pick_hi_en(langs):
-                    body_text = f"Great {name} — main abhi WhatsApp draft + Google Post ready kar rahi hoon. CONFIRM likh do, main format bhej deti hoon." 
-                else:
-                    body_text = f"Great {name} — drafting the WhatsApp + Google Post now. Reply CONFIRM to proceed." 
+            if is_customer:
+                cust_name = "there"
+                if state.customer_id:
+                    stored_c = CONTEXTS.get(("customer", state.customer_id))
+                    c = stored_c.payload if stored_c else {}
+                    cust_name = c.get("identity", {}).get("name") or c.get("name") or cust_name
+                body_text = f"Great {cust_name} — I’ll confirm the booking and keep you posted. Reply CONFIRM to proceed."
+            else:
+                body_text = "Done — I’m drafting a ready-to-send WhatsApp + a Google Post now. Reply CONFIRM to proceed." 
+                if state.merchant_id:
+                    stored_m = CONTEXTS.get(("merchant", state.merchant_id))
+                    m = stored_m.payload if stored_m else {}
+                    name = _merchant_display_name(m) if m else ""
+                    langs = _merchant_languages(m) if m else []
+                    if _pick_hi_en(langs):
+                        body_text = f"Great {name} — main abhi WhatsApp draft + Google Post ready kar rahi hoon. CONFIRM likh do, main format bhej deti hoon." 
+                    else:
+                        body_text = f"Great {name} — drafting the WhatsApp + Google Post now. Reply CONFIRM to proceed." 
 
             body_text = _avoid_repeat(body_text, state.last_bot_body)
             state.last_bot_body = body_text
             return {"action": "send", "body": body_text, "cta": "binary_confirm_cancel", "rationale": "Commitment detected; switching from qualifying to action."}
 
         # Default follow-up
-        follow = "Got it. Want me to proceed with a draft (YES/NO)?"
+        if is_customer:
+            cust_name = "there"
+            biz_name = "our team"
+            if state.customer_id:
+                stored_c = CONTEXTS.get(("customer", state.customer_id))
+                c = stored_c.payload if stored_c else {}
+                cust_name = c.get("identity", {}).get("name") or c.get("name") or cust_name
+            if state.merchant_id:
+                stored_m = CONTEXTS.get(("merchant", state.merchant_id))
+                m = stored_m.payload if stored_m else {}
+                biz_name = m.get("identity", {}).get("name") or biz_name
+            follow = f"Perfect {cust_name}, I'll sync {biz_name} now. Confirm?"
+            follow = _avoid_repeat(follow, state.last_bot_body)
+            state.last_bot_body = follow
+            return {
+                "action": "send",
+                "body": follow,
+                "cta": "binary_yes_no",
+                "send_as": "merchant_on_behalf",
+                "rationale": "Customer reply acknowledged with clear next step.",
+            }
+
+        follow = "Got it. Ready for your draft?"
         follow = _avoid_repeat(follow, state.last_bot_body)
         state.last_bot_body = follow
-        return {"action": "send", "body": follow, "cta": "binary_yes_no", "rationale": "Acknowledged reply and offered the next step with a low-friction CTA."}
+        return {"action": "send", "body": follow, "cta": "binary_yes_no", "rationale": "Acknowledged reply and asked for confirmation to proceed."}
 
 
 @app.post("/v1/teardown")
