@@ -4,6 +4,12 @@ import threading
 import hashlib
 import json
 import os
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    # dotenv not installed or .env not present; environment variables may be set externally
+    pass
 from datetime import datetime, timezone
 from typing import Any, Optional, Literal
 from urllib import request as urlrequest
@@ -408,6 +414,59 @@ def _apply_category_guardrails(body: str, category: dict[str, Any], merchant: di
     return guarded
 
 
+def _decorate_message(composed: dict[str, Any], trigger: dict[str, Any], merchant: dict[str, Any], category: dict[str, Any]) -> dict[str, Any]:
+    """Prepend a short, factual lead sentence derived from trigger payload to improve specificity."""
+    body = composed.get("body", "") or ""
+    kind = trigger.get("kind") or ""
+    trg = trigger.get("payload", {}) or {}
+    owner = merchant.get("identity", {}).get("owner_first_name") or _merchant_display_name(merchant)
+
+    lead = ""
+    if kind in {"perf_dip", "perf_spike"}:
+        delta = trg.get("delta_pct")
+        calls = merchant.get("performance", {}).get("calls")
+        vs = trg.get("vs_baseline")
+        if delta is not None:
+            try:
+                d_s = f"{int(float(delta) * 100)}%"
+            except Exception:
+                d_s = str(delta)
+            lead = f"{owner}, in the recent window {('increase' if delta>0 else 'decrease')} of {d_s} observed." if d_s else ""
+            if vs is not None:
+                lead = f"{owner}, {d_s} vs baseline {vs}."
+        elif calls is not None:
+            lead = f"{owner}, current calls: {_format_number(calls)}." 
+
+    elif kind == "renewal_due":
+        days = trg.get("days_remaining") or merchant.get("subscription", {}).get("days_remaining")
+        amount = trg.get("renewal_amount") or merchant.get("subscription", {}).get("renewal_amount")
+        if days is not None:
+            lead = f"{owner}, your plan renews in {days} days."
+            if amount is not None:
+                lead += f" Renewal amount: ₹{_format_number(amount)}."
+
+    elif kind == "festival_upcoming":
+        festival = trg.get("festival") or trg.get("payload", {}).get("festival") or trg.get("name")
+        days = trg.get("days_until") or trg.get("days_to") or trg.get("payload", {}).get("days_until")
+        if festival and days is not None:
+            lead = f"{owner}, {festival} is in {days} days." 
+
+    elif kind == "competitor_opened":
+        comp = trg.get("competitor_name") or trg.get("payload", {}).get("competitor_name")
+        offer = trg.get("their_offer") or trg.get("payload", {}).get("their_offer")
+        if comp:
+            lead = f"{owner}, competitor {comp} opened nearby."
+            if offer:
+                lead += f" Their offer: {offer}."
+
+    # Only prepend if lead is non-empty and not already present
+    if lead:
+        norm = re.sub(r"\s+", " ", body.lower())
+        if lead.lower().strip() not in norm:
+            composed["body"] = lead + " " + body
+    return composed
+
+
 def _extract_json(text: str) -> Optional[dict[str, Any]]:
     match = re.search(r"\{[\s\S]*\}", text)
     if not match:
@@ -612,6 +671,21 @@ def _category_action_suggestion(category: dict[str, Any]) -> str:
     return "targeted offer or service highlight"
 
 
+def _performance_snapshot(merchant: dict[str, Any]) -> str:
+    """Return a short, factual performance snapshot using available metrics."""
+    perf = merchant.get("performance", {}) or {}
+    parts: list[str] = []
+    if perf.get("views") is not None:
+        parts.append(f"views {_format_number(perf.get('views'))}")
+    if perf.get("calls") is not None:
+        parts.append(f"calls {_format_number(perf.get('calls'))}")
+    if perf.get("ctr") is not None:
+        parts.append(f"CTR {_format_pct(perf.get('ctr'))}")
+    if not parts:
+        return ""
+    return "As of our latest snapshot: " + ", ".join(parts) + ". "
+
+
 def _avoid_repeat(candidate: str, last: Optional[str]) -> str:
     if not last:
         return candidate
@@ -635,6 +709,7 @@ def _compose_message(
 
     hi_en = _pick_hi_en(_merchant_languages(merchant))
     merchant_name = _merchant_display_name(merchant)
+    owner_first = merchant.get("identity", {}).get("owner_first_name") or merchant_name
     biz_name = merchant.get("identity", {}).get("name", merchant_name)
     locality = merchant.get("identity", {}).get("locality")
     voice_prefix = _category_voice_prefix(category)
@@ -798,6 +873,7 @@ def _compose_message(
 
         parts = []
         name_line = salutation
+        owner_line = owner_first
         parts.append(f"{name_line}, saw this research:")
         parts.append(f"'{title}'")
         if trial_n:
@@ -806,9 +882,12 @@ def _compose_message(
             parts.append(f"relevant to {patient_segment.replace('_', ' ')}")
         if source:
             parts.append(f"— {source}")
-        parts.append(f"Worth a post? {_outcome_hint(kind, calls)}")
+        parts.append(f"Worth a post? {_outcome_hint(kind, calls)} Reply YES and I'll draft a concise post for you.")
 
         body = " ".join(parts).replace("  ", " ").strip()
+        perf_snap = _performance_snapshot(merchant)
+        if perf_snap:
+            body = perf_snap + body
         if hi_en:
             body = f"{salutation}, ek research mila: '{title}' {('— ' + f'{_format_number(trial_n)} patients' if trial_n else '')}. " + (f"Segment: {patient_segment.replace('_', ' ')}. " if patient_segment else "") + (f"Source: {source}. " if source else "") + f"{_outcome_hint(kind, calls)}. Kya post kar du?"
 
@@ -826,10 +905,18 @@ def _compose_message(
 
     if kind in {"perf_spike", "perf_dip"}:
         direction = "up" if kind == "perf_spike" else "down"
-        delta = perf.get("delta_7d", {}).get("views_pct")
-        calls_delta = perf.get("delta_7d", {}).get("calls_pct")
-        delta_str = f"{int(delta * 100)}%" if isinstance(delta, (float, int)) else ""
-        calls_str = f"{int(calls_delta * 100)}%" if isinstance(calls_delta, (float, int)) else ""
+        # Prefer trigger payload deltas when available; fall back to merchant perf deltas
+        trg_payload = trigger.get("payload", {}) if trigger else {}
+        delta = trg_payload.get("delta_pct") if trg_payload.get("delta_pct") is not None else perf.get("delta_7d", {}).get("views_pct")
+        calls_delta = trg_payload.get("calls_pct") if trg_payload.get("calls_pct") is not None else perf.get("delta_7d", {}).get("calls_pct")
+        try:
+            delta_str = f"{int(float(delta) * 100)}%" if delta is not None else ""
+        except Exception:
+            delta_str = f"{delta}" if delta else ""
+        try:
+            calls_str = f"{int(float(calls_delta) * 100)}%" if calls_delta is not None else ""
+        except Exception:
+            calls_str = f"{calls_delta}" if calls_delta else ""
 
         name_line = salutation
         local = f" in {locality}" if locality else ""
@@ -838,7 +925,42 @@ def _compose_message(
         perf_lang = _category_perf_language(category, direction)
         action_suggestion = _category_action_suggestion(category)
         
+        # Include trigger-level facts when available
+        trg_payload = trigger.get("payload", {}) if trigger else {}
+        window = trg_payload.get("window") or trg_payload.get("window_days") or "7d"
+        vs_baseline = trg_payload.get("vs_baseline")
         body = f"{name_line}, {perf_lang} this week{local}. "
+        # Add succinct trigger fact upfront when available, include prior baseline when we can compute it
+        if delta_str:
+            fact = f"In the last {window}, {('up' if direction=='up' else 'down')} {delta_str}"
+            # compute prior value when possible to increase specificity
+            prev_note = ""
+            try:
+                if views is not None and isinstance(views, (int, float)) and isinstance(delta, (int, float)) and (1 + float(delta)) != 0:
+                    prev_views = int(float(views) / (1 + float(delta)))
+                    prev_note = f" (from { _format_number(prev_views)} to {_format_number(views)})"
+            except Exception:
+                prev_note = ""
+            if prev_note:
+                fact += prev_note
+            if vs_baseline:
+                fact += f" vs baseline {vs_baseline}"
+            fact += ". "
+            # include last Vera interaction date if available
+            last_ts = None
+            history = merchant.get("conversation_history", []) or []
+            if history:
+                last_ts = history[-1].get("ts")
+                if last_ts:
+                    try:
+                        last_date = last_ts.split("T")[0]
+                        fact += f"Last contact: {last_date}. "
+                    except Exception:
+                        pass
+            body = fact + body
+        perf_snap = _performance_snapshot(merchant)
+        if perf_snap:
+            body = perf_snap + body
         body += f"Views: {_format_number(views) if views is not None else 'n/a'}, Calls: {_format_number(calls) if calls is not None else 'n/a'}, CTR: {_format_pct(ctr)} (vs peers {_format_pct(peer_ctr)}). "
         if calls_str:
             body += f"Calls shifted {calls_str}. "
@@ -846,10 +968,20 @@ def _compose_message(
             body += f"Views moved {delta_str}. "
         
         outcome = _outcome_hint(kind, calls, direction)
-        if kind == "perf_dip":
-            cta_text = f"Should I draft a {action_suggestion}?"
+        # Concrete recommendation to improve decision quality
+        if offer_hint:
+            recommendation = f"Recommendation: promote your current offer '{offer_hint}' for 7 days and pin as a GBP post. I'll draft the post + a WhatsApp template."
         else:
-            cta_text = "Want me to boost this with a post or offer?"
+            recommendation = f"Recommendation: run a short 7-day visibility post (carousel or offer) targeted to nearby searchers. I'll draft 2 captions + a WhatsApp template."
+        # Estimate lift (fallback to small number if unknown)
+        try:
+            est_lift = max(1, int(abs(float(calls)) * 0.15)) if calls is not None else 2
+        except Exception:
+            est_lift = 2
+        if kind == "perf_dip":
+            cta_text = f"{recommendation} Reply YES and I'll prepare 2 ready-to-post messages + one short offer text — expect ~{est_lift} extra calls/week if applied."
+        else:
+            cta_text = f"{recommendation} Reply YES and I'll draft 2 post captions + one quick offer — could convert into ~{est_lift} extra calls/week."
         body += f"{outcome}. {cta_text}"
 
         if hi_en:
@@ -871,15 +1003,18 @@ def _compose_message(
         }
 
     if kind == "review_theme_emerged":
-        themes = merchant.get("review_themes", []) or []
-        top = themes[0] if themes else {}
-        theme = top.get("theme")
-        occurrences = top.get("occurrences_30d")
-        quote = top.get("common_quote")
+        # Prefer trigger payload for review theme details when available
+        trg_payload = trigger.get("payload", {}) if trigger else {}
+        theme = trg_payload.get("theme") or (merchant.get("review_themes", []) or [{}])[0].get("theme")
+        occurrences = trg_payload.get("occurrences_30d") or (merchant.get("review_themes", []) or [{}])[0].get("occurrences_30d")
+        quote = trg_payload.get("common_quote") or (merchant.get("review_themes", []) or [{}])[0].get("common_quote")
         name_line = salutation
         peer_reviews = category.get("peer_stats", {}).get("avg_reviews")
         
+        perf_snap = _performance_snapshot(merchant)
         body = f"{name_line}, your reviews are flagging something important."
+        if perf_snap:
+            body = perf_snap + body
         if theme and occurrences is not None:
             body = f"{name_line}, {occurrences} recent reviews mentioned: '{theme.replace('_', ' ')}'."
         if quote:
@@ -887,7 +1022,7 @@ def _compose_message(
         if peer_reviews is not None:
             body += f" (Peer avg: {_format_number(peer_reviews)} reviews)."
         
-        body += f" {_outcome_hint(kind, calls)}. Want me to draft a response?"
+        body += f" {_outcome_hint(kind, calls)}. Want me to draft a response? Reply YES and I'll prepare a suggested reply you can send." 
         
         if hi_en:
             body = f"{salutation}, reviews me ek pattern clear aaya." 
@@ -911,9 +1046,15 @@ def _compose_message(
         days_left = merchant.get("subscription", {}).get("days_remaining")
         plan = merchant.get("subscription", {}).get("plan")
         days_text = f"{days_left} days" if isinstance(days_left, int) else "soon"
-        
-        body = f"{salutation}, your {plan or 'plan'} renewal is due {days_text}. " 
-        body += f"{_outcome_hint(kind, calls)}. Need me to send renewal options?"
+        trg_payload = trigger.get("payload", {}) if trigger else {}
+        amount = trg_payload.get("renewal_amount") or merchant.get("subscription", {}).get("renewal_amount")
+        amount_text = f" Renewal amount: ₹{_format_number(amount)}." if amount is not None else ""
+
+        perf_snap = _performance_snapshot(merchant)
+        body = f"{salutation}, your {plan or 'plan'} renewal is due {days_text}.{amount_text} " 
+        if perf_snap:
+            body = perf_snap + body
+        body += f"{_outcome_hint(kind, calls)}. Need me to send renewal options? Reply YES and I'll send tailored options with pricing."
         
         if hi_en:
             body = f"{salutation}, aapka {plan or 'plan'} renewal {days_text} me expire hone wala hai. {_outcome_hint(kind, calls)}. Kya renewal options bhej du?"
@@ -933,7 +1074,10 @@ def _compose_message(
     if kind == "milestone_reached":
         milestone_data = trigger.get("payload", {}).get("milestone") or "a big milestone"
         achievement = f"You hit {milestone_data}! 🎯" if milestone_data and milestone_data != "a big milestone" else "You reached a milestone! 🎯"
-        body = f"{salutation}, {achievement} {_outcome_hint(kind, calls)}. Should I turn this into a celebratory post your customers will love?"
+        perf_snap = _performance_snapshot(merchant)
+        body = f"{salutation}, {achievement} {_outcome_hint(kind, calls)}. Should I turn this into a celebratory post your customers will love? Reply YES and I'll draft a short post with visuals suggestion."
+        if perf_snap:
+            body = perf_snap + body
         if hi_en:
             body = f"{salutation}, iss week ek milestone achieve hua! 🎯 {_outcome_hint(kind, calls)}. Kya social proof ke saath post banate hain?"
         cta = "binary_yes_no"
@@ -950,9 +1094,19 @@ def _compose_message(
 
     if kind == "competitor_opened":
         local_ref = f" in {locality}" if locality else ""
-        body = f"{salutation}, a new competitor just listed nearby{local_ref}. {_outcome_hint(kind, calls)}. Want me to draft a differentiation post?"
+        perf_snap = _performance_snapshot(merchant)
+        comp_name = trigger.get("payload", {}).get("competitor_name") or None
+        comp_offer = trigger.get("payload", {}).get("their_offer") or None
+        extra = ""
+        if comp_name:
+            extra = f" Competitor: {comp_name}."
+        if comp_offer:
+            extra += f" Their offer: {comp_offer}."
+        body = f"{salutation}, a new competitor just listed nearby{local_ref}.{extra} {_outcome_hint(kind, calls)}. Want me to draft a differentiation post? Reply YES and I'll prepare a strong post highlighting your strengths."
+        if perf_snap:
+            body = perf_snap + body
         if hi_en:
-            body = f"{salutation}, nearby area me ek naya shop aaya hai. {_outcome_hint(kind, calls)}. Kya main ek strong post draft kar du to aapko stand out karun?"
+            body = f"{salutation}, nearby area me ek naya shop aaya hai.{(' ' + comp_name) if comp_name else ''} {_outcome_hint(kind, calls)}. Kya main ek strong post draft kar du to aapko stand out karun?"
         cta = "binary_yes_no"
         rationale = "Competitor trigger; directly offers strategic post to defend position."
         return {
@@ -971,10 +1125,15 @@ def _compose_message(
         when_text = f"in {when} days" if when is not None else "coming up"
         local = f" in {locality}" if locality else ""
         
-        body = f"{salutation}, {festival} {when_text}{local}! 🎉 {_outcome_hint(kind, calls)}. Want me to create a post for this?"
+        perf_snap = _performance_snapshot(merchant)
         if offer_hint:
-            body = f"{salutation}, {festival} {when_text}! 🎉 {_outcome_hint(kind, calls)}. Should I highlight '{offer_hint}' in a post?"
-        
+            rec = f"Recommendation: feature '{offer_hint}' with a festive combo and run a short pinned post. I'll draft 2 caption variants + one WhatsApp template you can copy."
+            body = f"{salutation}, {festival} {when_text}! 🎉 {_outcome_hint(kind, calls)}. {rec} Reply YES and I'll draft the assets."
+        else:
+            rec = "Recommendation: run a short pinned festive post with a clear offer or menu highlight. I'll draft 2 caption variants + one WhatsApp template you can copy."
+            body = f"{salutation}, {festival} {when_text}{local}! 🎉 {_outcome_hint(kind, calls)}. {rec} Reply YES and I'll draft the assets."
+        if perf_snap:
+            body = perf_snap + body
         if hi_en:
             body = f"{salutation}, {festival} {when_text}! 🎉 {_outcome_hint(kind, calls)}. Kya main ek strong post draft kar du?"
         
@@ -992,7 +1151,10 @@ def _compose_message(
 
     if kind == "curious_ask_due":
         local_ref = f" {locality}" if locality else ""
-        body = f"Hi {salutation}, quick question: what's the #1 {action_noun} you're getting asked about{local_ref} this week? {_outcome_hint(kind, calls)}. I'll turn it into a Google Post + WhatsApp template."
+        perf_snap = _performance_snapshot(merchant)
+        body = f"Hi {salutation}, quick question: what's the #1 {action_noun} you're getting asked about{local_ref} this week? {_outcome_hint(kind, calls)}. I'll turn it into a Google Post + WhatsApp template. Reply with your answer and I'll draft the assets."
+        if perf_snap:
+            body = perf_snap + body
         if hi_en:
             body = f"Hi {salutation}, ek quick sawal: iss week sabse zyada kis {action_noun} ka pooch rahe ho customers? {_outcome_hint(kind, calls)}. Main uska Google Post + WhatsApp draft banata hoon."
         cta = "open_ended"
@@ -1013,7 +1175,10 @@ def _compose_message(
         if history:
             last_ts = history[-1].get("ts")
         
-        body = f"{salutation}, it's been a while. {_outcome_hint(kind, calls)}. Got 2 minutes for a quick refresh?"
+        perf_snap = _performance_snapshot(merchant)
+        body = f"{salutation}, it's been a while. {_outcome_hint(kind, calls)}. Got 2 minutes for a quick refresh? Reply YES and I'll propose 2 quick actions to restart leads."
+        if perf_snap:
+            body = perf_snap + body
         if last_ts:
             body = f"{salutation}, last message was {last_ts.split('T')[0]}. {_outcome_hint(kind, calls)}. Free for a 2-minute catch up?"
         
@@ -1047,7 +1212,10 @@ def _compose_message(
     context = ", ".join(data_points) if data_points else "your performance"
     outcome = _outcome_hint(kind, calls)
     
-    body = f"{salutation}, {context}: {outcome}. {('on ' + topic + ': ' if topic else '')}Worth exploring?"
+    body = f"{salutation}, {context}: {outcome}. {('on ' + topic + ': ' if topic else '')}Worth exploring? Reply YES and I'll draft a starting post."
+    perf_snap = _performance_snapshot(merchant)
+    if perf_snap:
+        body = perf_snap + body
     if hi_en:
         body = f"{salutation}, {context}. {outcome}. Kya draft kar du?"
     
@@ -1199,6 +1367,8 @@ def tick(body: TickBody) -> dict[str, Any]:
                     continue
 
             composed = _compose_message(category=category, merchant=merchant, trigger=trg, customer=customer)
+            # Prepend a concise trigger-linked factual lead to improve specificity
+            composed = _decorate_message(composed, trg, merchant, category)
             composed = _llm_compose(category, merchant, trg, customer, composed)
             composed = _polish_merchant_body(composed, category, merchant, trg, customer)
             composed["body"] = _apply_category_guardrails(
@@ -1268,6 +1438,43 @@ def tick(body: TickBody) -> dict[str, Any]:
             LAST_BODY_HASH_BY_MERCHANT[merchant_id] = fingerprint
 
     return {"actions": actions}
+
+
+class DebugComposeRequest(BaseModel):
+    trigger_id: str
+
+
+@app.post("/v1/debug_compose")
+def debug_compose(body: DebugComposeRequest) -> dict[str, Any]:
+    """Return intermediate compositions for a trigger (fallback, decorated, llm_polished, final).
+
+    Useful for local debugging and focused LLM polishing inspection.
+    """
+    trg_id = body.trigger_id
+    stored = CONTEXTS.get(("trigger", trg_id))
+    if not stored:
+        return {"error": "trigger not found"}
+    trg = stored.payload
+    merchant_id = trg.get("merchant_id")
+    merchant = CONTEXTS.get(("merchant", merchant_id)).payload if ("merchant", merchant_id) in CONTEXTS else None
+    category_slug = merchant.get("category_slug") if merchant else None
+    category = CONTEXTS.get(("category", category_slug)).payload if category_slug and ("category", category_slug) in CONTEXTS else None
+    customer_id = trg.get("customer_id")
+    customer = CONTEXTS.get(("customer", customer_id)).payload if customer_id and ("customer", customer_id) in CONTEXTS else None
+
+    fallback = _compose_message(category or {"slug":"general"}, merchant or {}, trg, customer)
+    decorated = _decorate_message(dict(fallback), trg, merchant or {}, category or {})
+    llm_polished = _llm_compose(category or {}, merchant or {}, trg, customer, dict(decorated))
+    final = _polish_merchant_body(dict(llm_polished), category or {}, merchant or {}, trg, customer)
+    final_body = _apply_category_guardrails(final.get("body", ""), category or {}, merchant or {}, final.get("send_as", "vera"))
+
+    return {
+        "trigger_id": trg_id,
+        "fallback": fallback,
+        "decorated": decorated,
+        "llm_polished": llm_polished,
+        "final": {**final, "body": final_body},
+    }
 
 
 class ReplyBody(BaseModel):
