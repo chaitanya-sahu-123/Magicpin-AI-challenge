@@ -32,6 +32,11 @@ app = FastAPI()
 START_TS = time.time()
 LOCK = threading.RLock()
 
+# Judge-imposed operational limits (see testing brief §5). Keep these honored —
+# exceeding them costs operational-penalty points even if message quality is high.
+MAX_ACTIONS_PER_TICK = 20
+MAX_TRIGGERS_PER_MERCHANT_PER_TICK = 2
+
 
 class StoredContext(BaseModel):
     version: int
@@ -78,8 +83,9 @@ SENT_SUPPRESSIONS: dict[str, float] = {}
 # merchant_id -> consecutive auto-reply count (across conversations)
 AUTO_REPLY_STREAK_BY_MERCHANT: dict[str, int] = {}
 
-# merchant_id -> last body fingerprint to prevent cross-conversation repeats
-LAST_BODY_HASH_BY_MERCHANT: dict[str, str] = {}
+# conversation_id -> last body fingerprint (anti-repetition is scoped to a conversation,
+# per testing-brief §10: "same body verbatim it sent before in the SAME conversation")
+LAST_BODY_HASH_BY_CONV: dict[str, str] = {}
 
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "moonshotai/kimi-k2")
@@ -195,6 +201,20 @@ def _body_fingerprint(body: str) -> str:
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 
+def _stable_pick(items: list[str], *keys: Any) -> str:
+    """Deterministically pick one of `items` based on a hash of `keys`.
+
+    Used to vary CTA/closing phrasing across trigger kinds & merchants so the
+    same message shape doesn't repeat verbatim across 30 different messages,
+    while staying fully deterministic (required by the challenge brief).
+    """
+    if not items:
+        return ""
+    h = hashlib.sha256("|".join(str(k) for k in keys).encode("utf-8")).hexdigest()
+    idx = int(h[:8], 16) % len(items)
+    return items[idx]
+
+
 def _slot_options_from_preference(pref: Optional[str]) -> list[str]:
     if not pref:
         return []
@@ -298,7 +318,38 @@ def _outcome_hint(kind: str, calls: Any, direction: Optional[str] = None) -> str
         return "Skip the visibility gap"
     if kind == "milestone_reached":
         return "Turn this into social proof"
+    if kind == "weather_heatwave":
+        return "Ride the weather-driven search spike"
+    if kind == "local_news_event":
+        return "Catch nearby footfall while attention is high"
+    if kind == "regulation_change":
+        return "Stay ahead of the compliance shift"
+    if kind == "category_trend_movement":
+        return "Get in front of rising local demand"
+    if kind == "scheduled_recurring":
+        return "Keep momentum with a quick weekly touch"
     return "Improve discovery and response this week"
+
+
+def _peer_social_proof(category: dict[str, Any], merchant: dict[str, Any]) -> str:
+    """Build a short social-proof line from category peer stats, when available.
+
+    This is the #3 compulsion lever the brief flags as most under-used by
+    production Vera ("3 dentists in your locality did Y this month").
+    """
+    peer = category.get("peer_stats", {}) or {}
+    slug = category.get("slug") or "peers"
+    avg_reviews = peer.get("avg_reviews")
+    avg_rating = peer.get("avg_rating")
+    scope_label = peer.get("scope", "").replace("_", " ") if peer.get("scope") else slug
+    bits = []
+    if avg_rating is not None:
+        bits.append(f"{avg_rating}★ avg")
+    if avg_reviews is not None:
+        bits.append(f"{_format_number(avg_reviews)} avg reviews")
+    if not bits:
+        return ""
+    return f"Peer {scope_label} benchmark: {', '.join(bits)}."
 
 
 def _polish_merchant_body(
@@ -313,9 +364,13 @@ def _polish_merchant_body(
 
     system = (
         "You rewrite a draft WhatsApp message for a merchant assistant. "
-        "Preserve the facts, merchant name, CTA, and send_as exactly. "
-        "Improve naturalness, persuasion, and category fit. "
-        "Do NOT add facts, URLs, promises, or new claims. Output JSON with keys: body, rationale."
+        "Preserve every fact, number, name, CTA intent, and send_as exactly. "
+        "Improve naturalness, persuasion, and category fit — sound like a sharp "
+        "colleague texting, not a template. Vary sentence rhythm; avoid stock "
+        "phrases like 'Reply YES and I'll draft' if the draft already uses them "
+        "elsewhere in this conversation. Where the context includes peer/category "
+        "benchmarks, prefer weaving in social proof naturally. "
+        "Do NOT add facts, URLs, promises, or new claims. Output ONLY JSON with keys: body, rationale."
     )
 
     payload = {
@@ -330,9 +385,9 @@ def _polish_merchant_body(
         "Rewrite the draft body only, keeping the same meaning and factual anchors.\n"
         "Constraints:\n"
         "- Keep the CTA intent unchanged.\n"
-        "- Keep merchant/customer names and exact facts.\n"
+        "- Keep merchant/customer names and exact facts (numbers, dates, headlines).\n"
         "- Make it sound like a helpful colleague, not a system prompt.\n"
-        "- Keep it concise.\n\n"
+        "- Keep it concise (roughly the same length as the draft).\n\n"
         f"CONTEXT:\n{json.dumps(payload, ensure_ascii=True)}"
     )
 
@@ -343,7 +398,7 @@ def _polish_merchant_body(
             {"role": "user", "content": user},
         ],
         "temperature": 0.2,
-        "max_tokens": 300,
+        "max_tokens": 350,
     }
 
     try:
@@ -370,11 +425,15 @@ def _polish_merchant_body(
 
         fallback_body = str(fallback.get("body", ""))
         if fallback_body:
-            fallback_nums = re.findall(r"\d+(?:\.\d+)?%?", fallback_body)
-            body_nums = re.findall(r"\d+(?:\.\d+)?%?", body)
-            if fallback_nums and len(body_nums) < len(fallback_nums):
+            # Guard against fabrication: every numeric fact in the fallback must
+            # still be present (order-independent) in the polished body.
+            fallback_nums = set(re.findall(r"\d+(?:\.\d+)?%?", fallback_body))
+            body_nums = set(re.findall(r"\d+(?:\.\d+)?%?", body))
+            if fallback_nums and not fallback_nums.issubset(body_nums):
                 return fallback
-            if len(body) < max(40, len(fallback_body) * 0.55) or len(body) > len(fallback_body) * 1.5:
+            # Looser length guard than before — LLM rewrites are often tighter
+            # or slightly longer; only reject genuinely degenerate outputs.
+            if len(body) < 25 or len(body) > len(fallback_body) * 2.2:
                 return fallback
 
         merged = dict(fallback)
@@ -401,13 +460,15 @@ def _apply_category_guardrails(body: str, category: dict[str, Any], merchant: di
 
     slug = (category.get("slug") or "").lower()
     owner = _merchant_display_name(merchant)
-    prefixes = {
-        "dentists": f"Dr. {owner}",
-        "gyms": f"Coach {owner}",
-        "pharmacies": f"Pharmacist {owner}",
-    }
-    prefix = prefixes.get(slug)
+    title_words = {"dentists": "Dr.", "gyms": "Coach", "pharmacies": "Pharmacist"}
+    title = title_words.get(slug)
     start_window = guarded[:120].lower()
+    if title and owner.strip().lower().startswith(title.lower()):
+        prefix = owner
+    elif title:
+        prefix = f"{title} {owner}"
+    else:
+        prefix = None
     if prefix and prefix.lower() not in start_window:
         guarded = f"{prefix}, {guarded}"
 
@@ -489,8 +550,13 @@ def _llm_compose(
 
     system = (
         "You are composing a single WhatsApp message for a merchant assistant. "
-        "Use ONLY the provided context. Do NOT fabricate facts, offers, or sources. "
-        "Keep a single clear CTA. Output JSON with keys: body, cta, send_as, rationale."
+        "Use ONLY the provided context. Do NOT fabricate facts, offers, sources, or "
+        "competitor names. Anchor on the single most verifiable, specific fact "
+        "available (a number, date, headline, or peer benchmark) — never a vague "
+        "claim like 'grow your business'. Where useful, use social proof (peer "
+        "benchmarks) or ask the merchant a direct, low-effort question instead of "
+        "always defaulting to a YES/NO pitch. Keep a single clear CTA. "
+        "Output ONLY JSON with keys: body, cta, send_as, rationale."
     )
 
     payload = {
@@ -504,7 +570,7 @@ def _llm_compose(
         "Compose the next message as JSON.\n"
         "- Allowed CTA values: binary_yes_no, binary_confirm_cancel, multi_choice_slot, open_ended, none.\n"
         "- Respect category voice and taboos.\n"
-        "- Use concrete, verifiable facts from context.\n"
+        "- Use concrete, verifiable facts from context only.\n"
         "- For customer scope, set send_as to merchant_on_behalf.\n"
         "- Keep body concise.\n\n"
         f"CONTEXT:\n{json.dumps(payload, ensure_ascii=True)}"
@@ -587,13 +653,13 @@ def _category_voice_prefix(category: dict[str, Any]) -> str:
 
 def _category_salutation(category: dict[str, Any], merchant_name: str) -> str:
     slug = category.get("slug") or ""
-    if slug == "dentists":
-        return f"Dr. {merchant_name}"
-    if slug == "gyms":
-        return f"Coach {merchant_name}"
-    if slug == "pharmacies":
-        return f"Pharmacist {merchant_name}"
-    return merchant_name
+    prefixes = {"dentists": "Dr.", "gyms": "Coach", "pharmacies": "Pharmacist"}
+    prefix = prefixes.get(slug)
+    if not prefix:
+        return merchant_name
+    if merchant_name.strip().lower().startswith(prefix.lower()):
+        return merchant_name
+    return f"{prefix} {merchant_name}"
 
 
 def _category_action_noun(category: dict[str, Any]) -> str:
@@ -692,6 +758,30 @@ def _avoid_repeat(candidate: str, last: Optional[str]) -> str:
     if candidate.strip().lower() != last.strip().lower():
         return candidate
     return "Got it. Should I send the draft now? Reply YES." 
+
+
+# Closing CTA phrase banks, keyed by CTA "flavor". _stable_pick() deterministically
+# rotates through these per (merchant, trigger) so 30 messages don't all end
+# identically — this addresses judge feedback that repeated boilerplate closings
+# read as templated even when the underlying facts differ.
+_CLOSING_ACTION_PHRASES = [
+    "Reply YES and I'll draft it now.",
+    "Say the word and I'll get this ready for you.",
+    "Want me to put this together? Reply YES.",
+    "Reply YES — I'll have a draft back to you shortly.",
+    "One YES from you and it's in motion.",
+]
+
+_CLOSING_QUESTION_PHRASES = [
+    "What would you like to do?",
+    "Worth a look?",
+    "Should I go ahead?",
+    "Want me to take this further?",
+]
+
+
+def _closing_action(*keys: Any) -> str:
+    return _stable_pick(_CLOSING_ACTION_PHRASES, *keys)
 
 
 def _compose_message(
@@ -882,7 +972,7 @@ def _compose_message(
             parts.append(f"relevant to {patient_segment.replace('_', ' ')}")
         if source:
             parts.append(f"— {source}")
-        parts.append(f"Worth a post? {_outcome_hint(kind, calls)} Reply YES and I'll draft a concise post for you.")
+        parts.append(f"Worth a post? {_outcome_hint(kind, calls)}. {_closing_action(kind, merchant.get('merchant_id'), trigger.get('id'))}")
 
         body = " ".join(parts).replace("  ", " ").strip()
         perf_snap = _performance_snapshot(merchant)
@@ -1149,6 +1239,92 @@ def _compose_message(
             "template_params": [merchant_name, festival, when_text],
         }
 
+    if kind == "weather_heatwave":
+        trg_payload = trigger.get("payload", {}) if trigger else {}
+        temp = trg_payload.get("temp_c") or trg_payload.get("temperature")
+        city = trg_payload.get("city") or merchant.get("identity", {}).get("city") or locality
+        temp_text = f"{_format_number(temp)}°C" if temp is not None else "a heatwave"
+        local_ref = f" in {city}" if city else ""
+        angle = _category_action_suggestion(category)
+        perf_snap = _performance_snapshot(merchant)
+        body = f"{salutation}, {temp_text} today{local_ref} — search behavior usually shifts fast on days like this. {_outcome_hint(kind, calls)}. Recommendation: a quick weather-tied post ({angle}). {_closing_action(kind, merchant.get('merchant_id'), trigger.get('id'))}"
+        if perf_snap:
+            body = perf_snap + body
+        if hi_en:
+            body = f"{salutation}, aaj {temp_text}{local_ref} — is weather mein searches shift hoti hain. {_outcome_hint(kind, calls)}. Kya ek quick post bana du?"
+        cta = "binary_yes_no"
+        rationale = "External weather trigger; ties current conditions to a timely, category-relevant post."
+        return {
+            "body": body, "cta": cta, "send_as": "vera", "suppression_key": suppression_key,
+            "rationale": rationale, "template_name": "vera_weather_v1",
+            "template_params": [merchant_name, temp_text],
+        }
+
+    if kind == "local_news_event":
+        trg_payload = trigger.get("payload", {}) if trigger else {}
+        headline = trg_payload.get("headline") or trg_payload.get("event") or trg_payload.get("name")
+        duration = trg_payload.get("duration") or trg_payload.get("impact_window")
+        if not headline:
+            headline = "a local event nearby"
+        dur_text = f" (expected impact: {duration})" if duration else ""
+        perf_snap = _performance_snapshot(merchant)
+        body = f"{salutation}, heads up — {headline}{dur_text}. {_outcome_hint(kind, calls)}. Want a quick 'we're open & nearby' post to catch the extra footfall? {_closing_action(kind, merchant.get('merchant_id'), trigger.get('id'))}"
+        if perf_snap:
+            body = perf_snap + body
+        if hi_en:
+            body = f"{salutation}, ek update — {headline}{dur_text}. {_outcome_hint(kind, calls)}. Kya main ek quick post bana du?"
+        cta = "binary_yes_no"
+        rationale = "Local-news trigger; converts a nearby event into a timely footfall opportunity."
+        return {
+            "body": body, "cta": cta, "send_as": "vera", "suppression_key": suppression_key,
+            "rationale": rationale, "template_name": "vera_local_news_v1",
+            "template_params": [merchant_name, headline],
+        }
+
+    if kind == "regulation_change":
+        trg_payload = trigger.get("payload", {}) if trigger else {}
+        reg_title = trg_payload.get("title") or trg_payload.get("regulation") or "a category regulation update"
+        reg_source = trg_payload.get("source")
+        effective = trg_payload.get("effective_date") or trg_payload.get("effective_from")
+        eff_text = f" Effective {effective}." if effective else ""
+        src_text = f" — {reg_source}" if reg_source else ""
+        perf_snap = _performance_snapshot(merchant)
+        body = f"{salutation}, regulatory update: '{reg_title}'{src_text}.{eff_text} Want a 1-line summary of what changes for your practice? {_closing_action(kind, merchant.get('merchant_id'), trigger.get('id'))}"
+        if perf_snap:
+            body = perf_snap + body
+        if hi_en:
+            body = f"{salutation}, ek regulation update aaya hai: '{reg_title}'{src_text}.{eff_text} Kya main summary bhej du?"
+        cta = "binary_yes_no"
+        rationale = "Regulation-change trigger; category-relevant, source-cited, no overclaim."
+        return {
+            "body": body, "cta": cta, "send_as": "vera", "suppression_key": suppression_key,
+            "rationale": rationale, "template_name": "vera_regulation_v1",
+            "template_params": [merchant_name, reg_title],
+        }
+
+    if kind == "category_trend_movement":
+        trg_payload = trigger.get("payload", {}) if trigger else {}
+        query = trg_payload.get("query") or trg_payload.get("trend") or (category.get("trend_signals", [{}]) or [{}])[0].get("query")
+        delta_yoy = trg_payload.get("delta_yoy") or (category.get("trend_signals", [{}]) or [{}])[0].get("delta_yoy")
+        try:
+            delta_text = f"+{int(float(delta_yoy) * 100)}% YoY" if delta_yoy is not None else ""
+        except Exception:
+            delta_text = ""
+        query_text = query or "a related search trend"
+        perf_snap = _performance_snapshot(merchant)
+        body = f"{salutation}, local searches for '{query_text}' are up {delta_text or 'noticeably'}. {_outcome_hint(kind, calls)}. Want me to draft a post or offer that rides this trend? {_closing_action(kind, merchant.get('merchant_id'), trigger.get('id'))}"
+        if perf_snap:
+            body = perf_snap + body
+        if hi_en:
+            body = f"{salutation}, '{query_text}' searches badh rahi hain {delta_text}. {_outcome_hint(kind, calls)}. Kya isi trend pe ek post bana du?"
+        cta = "binary_yes_no"
+        rationale = "Category trend-signal trigger; anchors on a verifiable search-demand shift."
+        return {
+            "body": body, "cta": cta, "send_as": "vera", "suppression_key": suppression_key,
+            "rationale": rationale, "template_name": "vera_trend_v1",
+            "template_params": [merchant_name, query_text, delta_text],
+        }
+
     if kind == "curious_ask_due":
         local_ref = f" {locality}" if locality else ""
         perf_snap = _performance_snapshot(merchant)
@@ -1197,6 +1373,24 @@ def _compose_message(
             "template_params": [merchant_name],
         }
 
+    if kind == "scheduled_recurring":
+        # Weekly cadence "asking the merchant" beat — brief flags this lever (#7)
+        # as one of the most under-used in production Vera.
+        social_proof = _peer_social_proof(category, merchant)
+        perf_snap = _performance_snapshot(merchant)
+        body = f"Hi {salutation}, weekly check-in: what's one thing customers keep asking about{(' in ' + locality) if locality else ''} this week? {social_proof} I'll turn your answer into a ready post."
+        if perf_snap:
+            body = perf_snap + body
+        if hi_en:
+            body = f"Hi {salutation}, weekly check-in — iss hafte customers sabse zyada kya pooch rahe hain? {social_proof} Aapka jawab ek post me badal dungi."
+        cta = "open_ended"
+        rationale = "Recurring cadence beat; low-effort question keeps engagement frequency up between functional nudges."
+        return {
+            "body": body, "cta": cta, "send_as": "vera", "suppression_key": suppression_key,
+            "rationale": rationale, "template_name": "vera_weekly_checkin_v1",
+            "template_params": [merchant_name],
+        }
+
     # Fallback - data-driven for unknown trigger types
     topic = trigger.get("payload", {}).get("metric_or_topic")
     
@@ -1240,15 +1434,20 @@ KIND_PRIORITY: dict[str, int] = {
     "customer_lapsed_hard": 72,
     "trial_followup": 70,
     "perf_dip": 70,
+    "regulation_change": 66,
     "perf_spike": 60,
+    "weather_heatwave": 60,
     "review_theme_emerged": 58,
     "milestone_reached": 55,
     "research_digest": 50,
     "dormant_with_vera": 45,
     "festival_upcoming": 40,
+    "category_trend_movement": 38,
     "curious_ask_due": 35,
     "competitor_opened": 35,
+    "local_news_event": 32,
     "renewal_due": 30,
+    "scheduled_recurring": 20,
 }
 
 
@@ -1274,10 +1473,10 @@ def metadata() -> dict[str, Any]:
     return {
         "team_name": "local-dev",
         "team_members": ["you"],
-        "model": "openrouter" if USE_LLM else "rule-based (no LLM)",
-        "approach": "LLM composer + deterministic routing" if USE_LLM else "deterministic templates + trigger routing + basic reply handling",
+        "model": OPENROUTER_MODEL if USE_LLM else "rule-based (no LLM)",
+        "approach": "LLM composer (OpenRouter/Kimi K2) + deterministic routing + guardrails" if USE_LLM else "deterministic templates + trigger routing + basic reply handling",
         "contact_email": "",
-        "version": "0.1.0",
+        "version": "0.2.0",
         "submitted_at": _now_iso(),
     }
 
@@ -1294,8 +1493,21 @@ class ContextPushBody(BaseModel):
 def push_context(body: ContextPushBody, response: Response) -> dict[str, Any]:
     with LOCK:
         key = (body.scope, body.context_id)
-        # Challenge mode: always treat incoming judge pushes as source of truth.
-        CONTEXTS[key] = StoredContext(version=body.version, payload=body.payload, delivered_at=body.delivered_at)
+        existing = CONTEXTS.get(key)
+
+        # Idempotent on (scope, context_id, version): reject strictly-stale
+        # versions per testing-brief §2.1. Equal version is treated as a no-op
+        # accept (re-delivery), not an error.
+        if existing is not None and body.version < existing.version:
+            response.status_code = 409
+            return {
+                "accepted": False,
+                "reason": "stale_version",
+                "current_version": existing.version,
+            }
+
+        if existing is None or body.version > existing.version:
+            CONTEXTS[key] = StoredContext(version=body.version, payload=body.payload, delivered_at=body.delivered_at)
 
         return {
             "accepted": True,
@@ -1336,19 +1548,19 @@ def tick(body: TickBody) -> dict[str, Any]:
 
         candidates.sort(key=lambda x: (x[0], x[1]), reverse=True)
 
-        # FIX: Allow multiple triggers per merchant instead of limiting to one per merchant.
-        # Each trigger is independently processed and added to actions.
+        # Honor the judge's documented cap: max MAX_ACTIONS_PER_TICK actions per
+        # tick, and be selective per-merchant rather than exhausting the budget
+        # on one merchant. Restraint is explicitly rewarded (testing brief §14).
         picked_triggers: list[tuple[str, dict[str, Any]]] = []
         merchant_count: dict[str, int] = {}
-        
+
         for _, __, trg_id, trg in candidates:
             merchant_id = trg.get("merchant_id")
-            # Allow up to 3 triggers per merchant (instead of just 1)
-            if merchant_count.get(merchant_id, 0) >= 3:
+            if merchant_count.get(merchant_id, 0) >= MAX_TRIGGERS_PER_MERCHANT_PER_TICK:
                 continue
             picked_triggers.append((trg_id, trg))
             merchant_count[merchant_id] = merchant_count.get(merchant_id, 0) + 1
-            if len(picked_triggers) >= 50:  # Increased from 20 to allow more triggers
+            if len(picked_triggers) >= MAX_ACTIONS_PER_TICK:
                 break
 
         for trg_id, trg in picked_triggers:
@@ -1362,7 +1574,12 @@ def tick(body: TickBody) -> dict[str, Any]:
             if not category:
                 category = {"slug": "general", "peer_stats": {}}
             customer = CONTEXTS.get(("customer", customer_id)).payload if customer_id and ("customer", customer_id) in CONTEXTS else None
-            if trg.get("scope") == "customer" and customer:
+
+            # A customer-scoped trigger with no CustomerContext yet pushed cannot
+            # be composed correctly (wrong voice / wrong send_as) — skip until it lands.
+            if trg.get("scope") == "customer":
+                if not customer_id or not customer:
+                    continue
                 if not _consent_allows(customer, trg.get("kind") or ""):
                     continue
 
@@ -1382,11 +1599,16 @@ def tick(body: TickBody) -> dict[str, Any]:
             if _has_url(composed["body"]):
                 composed["body"] = re.sub(r"https?://\S+", "", composed["body"]).strip()
 
-            fingerprint = _body_fingerprint(composed["body"])
-            if LAST_BODY_HASH_BY_MERCHANT.get(merchant_id) == fingerprint:
+            # Never emit an empty body — treated as malformed by the judge.
+            if not composed.get("body", "").strip():
                 continue
 
             conv_id = f"conv_{merchant_id}_{trg_id}"
+
+            fingerprint = _body_fingerprint(composed["body"])
+            if LAST_BODY_HASH_BY_CONV.get(conv_id) == fingerprint:
+                continue
+
             if conv_id not in CONVERSATIONS:
                 CONVERSATIONS[conv_id] = ConversationState(
                     conversation_id=conv_id,
@@ -1435,7 +1657,7 @@ def tick(body: TickBody) -> dict[str, Any]:
             suppression_key = composed.get("suppression_key")
             if suppression_key:
                 SENT_SUPPRESSIONS[suppression_key] = time.time()
-            LAST_BODY_HASH_BY_MERCHANT[merchant_id] = fingerprint
+            LAST_BODY_HASH_BY_CONV[conv_id] = fingerprint
 
     return {"actions": actions}
 
@@ -1717,4 +1939,6 @@ def teardown() -> dict[str, Any]:
         CONTEXTS.clear()
         CONVERSATIONS.clear()
         SENT_SUPPRESSIONS.clear()
+        LAST_BODY_HASH_BY_CONV.clear()
+        AUTO_REPLY_STREAK_BY_MERCHANT.clear()
     return {"ok": True, "cleared_at": _now_iso()}
